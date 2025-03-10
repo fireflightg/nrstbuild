@@ -1,0 +1,180 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(storeId) {
+      return isAuthenticated() && 
+        get(/databases/$(database)/documents/stores/$(storeId)).data.ownerId == request.auth.uid;
+    }
+    
+    function getRole(storeId) {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/stores/$(storeId)/team/$(request.auth.uid)) ?
+          get(/databases/$(database)/documents/stores/$(storeId)/team/$(request.auth.uid)).data.role : null;
+    }
+    
+    function hasRole(storeId, role) {
+      return isOwner(storeId) || getRole(storeId) == role;
+    }
+    
+    function hasAnyRole(storeId, roles) {
+      return isOwner(storeId) || (getRole(storeId) in roles);
+    }
+    
+    function isDocumentOwner() {
+      return isAuthenticated() && resource.data.ownerId == request.auth.uid;
+    }
+    
+    function isUserVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+    
+    // Rate limiting helper
+    function isNotRateLimited(path) {
+      return true; // Implement actual rate limiting logic if needed
+    }
+    
+    // User profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || hasRole(resource.data.storeId, 'admin'));
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAuthenticated() && request.auth.uid == userId;
+      allow delete: if false; // Users should not be deleted directly
+    }
+    
+    // Stores
+    match /stores/{storeId} {
+      // Anyone can read store details
+      allow read: if true;
+      // Only authenticated users can create stores
+      allow create: if isAuthenticated() && isUserVerified() && isNotRateLimited('stores');
+      // Only store owner can update or delete
+      allow update: if isOwner(storeId);
+      allow delete: if isOwner(storeId);
+      
+      // Team rules
+      match /team/{userId} {
+        // Owners and team members can read team
+        allow read: if isOwner(storeId) || request.auth.uid == userId;
+        // Only owners can create, update, delete team members
+        allow create, update, delete: if isOwner(storeId);
+      }
+      
+      // Product rules
+      match /products/{productId} {
+        // Anyone can read products
+        allow read: if true;
+        // Owners and editors can create, update products
+        allow create, update: if isOwner(storeId) || hasAnyRole(storeId, ['editor']);
+        // Only owners can delete products
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Order rules
+      match /orders/{orderId} {
+        // Owners, editors, and viewers can read orders
+        allow read: if isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Only the system can create orders (via Cloud Functions)
+        allow create: if false;
+        // Owners and editors can update orders
+        allow update: if isOwner(storeId) || hasRole(storeId, 'editor');
+        // Only owners can delete orders
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Customer rules
+      match /customers/{customerId} {
+        // Owners, editors, and viewers can read customers
+        allow read: if isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Owners and editors can create and update customers
+        allow create, update: if isOwner(storeId) || hasRole(storeId, 'editor');
+        // Only owners can delete customers
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Settings rules
+      match /settings/{settingId} {
+        // Owners, editors, and viewers can read settings
+        allow read: if isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Only owners can create or delete settings
+        allow create, delete: if isOwner(storeId);
+        // Owners can update any settings, editors can only update appearance
+        allow update: if isOwner(storeId) || 
+          (hasRole(storeId, 'editor') && settingId == 'appearance');
+      }
+      
+      // Website rules
+      match /website/{pageId} {
+        // Anyone can read published pages
+        allow read: if resource.data.published == true || isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Owners and editors can create and update pages
+        allow create, update: if isOwner(storeId) || hasRole(storeId, 'editor');
+        // Only owners can delete pages
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Blog rules
+      match /blog/{postId} {
+        // Anyone can read published blog posts
+        allow read: if resource.data.published == true || isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Owners and editors can create and update blog posts
+        allow create, update: if isOwner(storeId) || hasRole(storeId, 'editor');
+        // Only owners can delete blog posts
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Analytics rules
+      match /analytics/{docId} {
+        // Owners, editors, and viewers can read analytics
+        allow read: if isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Only the system can write analytics (via Cloud Functions)
+        allow write: if false;
+      }
+      
+      // Widgets rules
+      match /widgets/{widgetId} {
+        // Anyone can read widgets
+        allow read: if true;
+        // Owners and editors can create and update widgets
+        allow create, update: if isOwner(storeId) || hasRole(storeId, 'editor');
+        // Only owners can delete widgets
+        allow delete: if isOwner(storeId);
+      }
+      
+      // Tracking rules
+      match /tracking/{trackingId} {
+        // Owners, editors, and viewers can read tracking
+        allow read: if isOwner(storeId) || hasAnyRole(storeId, ['editor', 'viewer']);
+        // Only owners can create, update, or delete tracking
+        allow create, update, delete: if isOwner(storeId);
+      }
+    }
+    
+    // Invitation rules
+    match /invitations/{invitationId} {
+      // Anyone can read their own invitations
+      allow read: if isAuthenticated() && 
+        (resource.data.email == request.auth.token.email || 
+         resource.data.invitedBy == request.auth.uid);
+      // Only authenticated users can create invitations
+      allow create: if isAuthenticated() && 
+        isOwner(resource.data.storeId);
+      // Only the invited user can update (accept/decline)
+      allow update: if isAuthenticated() && 
+        resource.data.email == request.auth.token.email;
+    }
+    
+    // Subscription rules
+    match /subscriptions/{subscriptionId} {
+      // Users can read their own subscriptions
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      // Only the system can write subscriptions (via Cloud Functions)
+      allow write: if false;
+    }
+  }
+}
+
